@@ -1,0 +1,13 @@
+{
+  "panel.title": "飞书",
+  "panel.heading": "飞书连接器",
+  "panel.intro": "用飞书账号授权后，DSH 即可读写你个人空间里的群消息、文档与表格。",
+  "auth.connected": "飞书账号已授权",
+  "auth.disconnected": "尚未授权",
+  "auth.login": "授权登录",
+  "auth.relogin": "重新授权",
+  "auth.refresh": "刷新状态",
+  "auth.done": "我已完成授权",
+  "state.loading": "读取状态中…",
+  "state.unknown": "状态未知"
+}

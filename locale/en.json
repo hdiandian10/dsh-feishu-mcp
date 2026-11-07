@@ -1,0 +1,13 @@
+{
+  "panel.title": "Feishu",
+  "panel.heading": "Feishu Connector",
+  "panel.intro": "Authorize with your Feishu account to let DSH read and write chats, docs, and sheets in your personal space.",
+  "auth.connected": "Feishu account authorized",
+  "auth.disconnected": "Not authorized",
+  "auth.login": "Sign in",
+  "auth.relogin": "Re-authorize",
+  "auth.refresh": "Refresh status",
+  "auth.done": "I have authorized",
+  "state.loading": "Loading status…",
+  "state.unknown": "Status unknown"
+}
