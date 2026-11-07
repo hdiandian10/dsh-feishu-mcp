@@ -1,23 +1,25 @@
 /**
- * dsh-feishu-mcp —— 飞书 / Lark MCP 连接器的 Host 半边。
+ * dsh-feishu-mcp —— 飞书 / Lark 连接器的 Host 半边。
  *
- * 职责只有三件：
- * 1. 把 App ID / App Secret 持久化到 lark-mcp 读取的那份配置里；
- * 2. 提供一个真实握手测试：拉起 `lark-mcp`，走完 MCP 的 `initialize` +
- *    `tools/list`，把工具数量报给界面；
- * 3. 暴露当前安装状态，让面板能提示「lark-mcp 未安装」。
+ * 职责有三件：
+ * 1. 桥接 `lark-cli`：把 agent 发起的飞书调用翻译成 CLI 命令并执行，
+ *    统一处理 `--json`、脱敏、审计与可逆性保护（不可逆操作先做快照再放行）；
+ * 2. 注册 `feishu_auth_*` 系列工具，用 device flow 完成用户授权与状态查询；
+ * 3. 挂载飞书相关技能（skills provider），把 lark-cli 的文档作为可检索资源暴露。
  *
- * ## 为什么配置文件是这个路径
+ * ## 历史：为什么这里没有 lark-mcp 了
  *
- * 真正的 MCP 连接由 profile 里的 `@deepseek-ai/dsh-mcp-client` 行负责，
- * 它以 `--config ~/.dsh/lark-mcp/lark-config.json` 启动 lark-mcp。
- * 面板**必须**写同一份文件，否则「保存」不会影响实际连接 —— 这正是
- * 上一版把配置写到 `feishu-mcp/config.json` 时的隐患。
+ * 早先本插件同时挂两条链路：`lark-cli`（工具 `feishu_cli`）与官方
+ * `@larksuiteoapi/lark-mcp` 子进程（工具 `mcp__feishu__*`）。
  *
- * ## 为什么不走 DSH settings
+ * lark-mcp 依赖 `keytar` 原生模块把 user token 存进系统凭据管理器。若 `keytar`
+ * 未编译成功，其 StorageManager 会把 isInitializedStorageSuccess 置为 false，
+ * saveStorageData() 直接 return —— 令牌只活在内存，子进程每次重启必然丢失，
+ * 持续报 `Current user_access_token is invalid or expired`。
  *
- * App Secret 是敏感值，settings 文档会被 `settings.describe()` 整体投影到前端。
- * 这里刻意用独立文件，读取接口只回「是否已配置」，永不回显明文。
+ * 实测两条链路能力重叠，且读群 / 建表 / 读写单元格 / 查文档全部由 lark-cli 承担，
+ * 因此 2026-11-07 彻底移除 lark-mcp：连接行、凭据表单、握手测试一并撤除。
+ * 现行架构只有 lark-cli 一条路，令牌由它自行持久化并自动刷新。
  *
  * ## 为什么 connection 是惰性注入
  *
@@ -26,9 +28,7 @@
  * 启动失败。因此用 `ctx.inject(['connection'], …)` 惰性挂载。
  */
 
-import { randomUUID } from 'node:crypto'
-import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -60,18 +60,9 @@ const CLI_TIMEOUT_MS = 120_000
 /** RPC 端点名（Client 侧 `connection.rpc.call('/api', 'feishu-mcp', …)`）。 */
 const ENDPOINT = 'feishu-mcp'
 
-/** lark-mcp 的安装位置。 */
-const LARK_HOME = join(homedir(), '.dsh', 'lark-mcp')
-const LARK_CLI = join(LARK_HOME, 'node_modules', '@larksuiteoapi', 'lark-mcp', 'dist', 'cli.js')
-
-/** 实际生效的配置 —— 与 profile 里 mcp-client 的 `--config` 参数是同一个文件。 */
-const LARK_CONFIG = join(LARK_HOME, 'lark-config.json')
-
-/** 握手超时：lark-mcp 冷启动要拉起近 200 个依赖，给足余量。 */
-const HANDSHAKE_TIMEOUT_MS = 60_000
-
-const DEFAULT_DOMAIN = 'https://open.feishu.cn'
-const DEFAULT_TOOLS = ['preset.light']
+// ⛔ 2026-11-07 删除 LARK_HOME / LARK_CLI / LARK_CONFIG / HANDSHAKE_TIMEOUT_MS /
+//    DEFAULT_DOMAIN / DEFAULT_TOOLS 六个常量。它们只被已删除的 lark-mcp 握手与凭据表单使用；
+//    lark-cli 桥用的是下面的 LARK_CLI_HOME / LARK_CLI_ENTRY，与它们无关。
 
 /**
  * 授权时请求的 scope 集。
@@ -137,43 +128,15 @@ function resolveNodeBin() {
   return { bin: process.execPath, electronShim: true }
 }
 
-/** 把配置文本解析成面板需要的字段，并保留解析错误供调用方展示。 */
-function parseConfigText(text) {
-  const empty = { appId: '', appSecret: '', domain: DEFAULT_DOMAIN, tools: DEFAULT_TOOLS, language: 'zh', tokenMode: 'auto' }
-  try {
-    const parsed = JSON.parse(text)
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return { ...empty, configError: '配置文件内容必须是 JSON 对象' }
-    }
-    return {
-      appId: typeof parsed.appId === 'string' ? parsed.appId : '',
-      appSecret: typeof parsed.appSecret === 'string' ? parsed.appSecret : '',
-      domain: typeof parsed.domain === 'string' && parsed.domain.length > 0 ? parsed.domain : DEFAULT_DOMAIN,
-      tools: Array.isArray(parsed.tools) && parsed.tools.length > 0
-        ? parsed.tools.filter((item) => typeof item === 'string')
-        : DEFAULT_TOOLS,
-      language: typeof parsed.language === 'string' && parsed.language.length > 0 ? parsed.language : 'zh',
-      tokenMode: typeof parsed.tokenMode === 'string' && parsed.tokenMode.length > 0 ? parsed.tokenMode : 'auto',
-    }
-  } catch {
-    return { ...empty, configError: '配置文件解析失败，请检查 JSON 格式。' }
-  }
-}
+// ⛔ 2026-11-07 删除 parseConfigText（原 140-161 行）。它只被 loadConfig 调用，
+//    而 loadConfig 已随凭据表单一起删除。原实现见 index.js.bak-20261107-145442。
 
-function loadConfig() {
-  if (!existsSync(LARK_CONFIG)) {
-    return { appId: '', appSecret: '', domain: DEFAULT_DOMAIN, tools: DEFAULT_TOOLS, language: 'zh', tokenMode: 'auto' }
-  }
-  try {
-    return parseConfigText(readFileSync(LARK_CONFIG, 'utf8'))
-  } catch {
-    return {
-      appId: '', appSecret: '', domain: DEFAULT_DOMAIN, tools: DEFAULT_TOOLS, language: 'zh', tokenMode: 'auto',
-      configError: '配置文件读取失败，请检查文件权限。',
-    }
-  }
-}
-
+/**
+ * 抹掉诊断文本里的敏感串。
+ *
+ * 原用于握手错误的脱敏；握手已删除，但 `__test` 仍导出本函数，且它是通用工具，
+ * 后续诊断信息仍可能用到，因此保留。
+ */
 function redactDiagnostic(value, secrets = []) {
   let text = String(value ?? '')
   for (const secret of secrets) {
@@ -182,171 +145,12 @@ function redactDiagnostic(value, secrets = []) {
   return text
 }
 
-/** 原子写入，避免保存到一半崩溃留下半个 JSON。 */
-function writeConfigFile(config) {
-  mkdirSync(LARK_HOME, { recursive: true })
-  const tmp = `${LARK_CONFIG}.tmp`
-  writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`, 'utf8')
-  renameSync(tmp, LARK_CONFIG)
-}
-
-/** 飞书自建应用的 App ID 是 `cli_` 前缀。 */
-function validateAppId(value) {
-  if (typeof value !== 'string' || value.trim().length === 0) return 'App ID 不能为空'
-  if (!/^cli_[A-Za-z0-9]+$/.test(value.trim())) return 'App ID 格式应为 cli_ 开头（飞书自建应用）'
-  return undefined
-}
-
-/**
- * 跑一次真实 MCP 握手：起进程 → initialize → tools/list → 收工。
- *
- * 刻意不引入 MCP SDK：握手只有两条 JSON-RPC 报文，手写比多一个依赖更稳。
- * 用临时 probe 文件而非正式配置，保证「测试」不会悄悄改动已保存的状态。
- */
-function runHandshake(config) {
-  return new Promise((resolve) => {
-    if (!existsSync(LARK_CLI)) {
-      resolve({
-        ok: false,
-        error: 'lark-mcp 未安装',
-        detail: `找不到 ${LARK_CLI}。请先安装 @larksuiteoapi/lark-mcp。`,
-      })
-      return
-    }
-
-    let probePath
-    try {
-      mkdirSync(LARK_HOME, { recursive: true })
-      probePath = join(LARK_HOME, `handshake-probe-${randomUUID()}.json`)
-      writeFileSync(probePath, `${JSON.stringify({
-        appId: config.appId,
-        appSecret: config.appSecret,
-        domain: config.domain,
-        tools: config.tools,
-        language: config.language ?? 'zh',
-        tokenMode: config.tokenMode ?? 'auto',
-      }, null, 2)}\n`, 'utf8')
-    } catch (error) {
-      try { if (probePath) unlinkSync(probePath) } catch { /* 报告原始写入错误 */ }
-      resolve({ ok: false, error: '无法写入临时配置', detail: redactDiagnostic(String(error?.message ?? error), [config.appSecret]) })
-      return
-    }
-
-    const diagnosticSecrets = [config.appSecret]
-    let child
-    let settled = false
-    let buffer = ''
-    let stderr = ''
-    let sawInit = false
-    let serverInfo
-
-    const finish = (result) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      try { child?.kill() } catch { /* 可能已退出 */ }
-      let cleanupFailed = false
-      try { if (probePath) unlinkSync(probePath) } catch { cleanupFailed = true }
-      if (result?.detail) result.detail = redactDiagnostic(result.detail, diagnosticSecrets)
-      if (cleanupFailed) result.detail = `${result.detail ? `${result.detail}\n` : ''}临时配置清理失败，请稍后检查并删除临时文件。`
-      resolve(result)
-    }
-
-    const timer = setTimeout(() => {
-      finish({
-        ok: false,
-        error: '握手超时',
-        detail: `lark-mcp 在 ${Math.round(HANDSHAKE_TIMEOUT_MS / 1000)} 秒内未完成握手。${stderr ? `\n${redactDiagnostic(stderr, diagnosticSecrets).slice(-800)}` : ''}`,
-      })
-    }, HANDSHAKE_TIMEOUT_MS)
-
-    try {
-      const { bin, electronShim } = resolveNodeBin()
-      child = spawn(bin, [LARK_CLI, 'mcp', '--config', probePath], {
-        cwd: LARK_HOME,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true,
-        env: electronShim ? { ...process.env, ELECTRON_RUN_AS_NODE: '1' } : process.env,
-      })
-    } catch (error) {
-      finish({ ok: false, error: '无法启动 lark-mcp', detail: error.message })
-      return
-    }
-
-    child.on('error', (error) => {
-      finish({ ok: false, error: '无法启动 lark-mcp', detail: error.message })
-    })
-    child.stdin?.on('error', (error) => {
-      finish({ ok: false, error: '握手写入失败', detail: error.message })
-    })
-    const sendRpc = (message) => {
-      if (settled) return
-      try { child.stdin?.write(`${JSON.stringify(message)}\n`) } catch (error) {
-        finish({ ok: false, error: '握手写入失败', detail: error.message })
-      }
-    }
-
-    // keytar 告警只影响 OAuth 令牌的本地加密，不影响 App 身份调用，不必上报。
-    child.stderr?.on('data', (chunk) => { stderr += chunk.toString() })
-
-    child.stdout?.on('data', (chunk) => {
-      buffer += chunk.toString()
-      let index
-      while ((index = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, index).trim()
-        buffer = buffer.slice(index + 1)
-        if (line.length === 0) continue
-
-        let message
-        try { message = JSON.parse(line) } catch { continue }
-
-        if (settled || !message || typeof message !== 'object') continue
-        if (message.id === 1 && !sawInit) {
-          if (message.error) {
-            finish({ ok: false, error: '初始化失败', detail: message.error.message || JSON.stringify(message.error) })
-            continue
-          }
-          sawInit = true
-          serverInfo = message.result?.serverInfo
-          if (settled) continue
-          sendRpc({ jsonrpc: '2.0', method: 'notifications/initialized' })
-          sendRpc({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })
-          continue
-        }
-
-        if (message.id === 2 && sawInit) {
-          if (Array.isArray(message.result?.tools)) {
-            const names = message.result.tools.map((tool) => tool?.name).filter(Boolean)
-            finish({ ok: true, toolCount: names.length, tools: names, serverInfo })
-          } else if (message.error) {
-            finish({ ok: false, error: '工具列表请求失败', detail: message.error.message || JSON.stringify(message.error) })
-          }
-        }
-      }
-    })
-
-    child.on('exit', (code) => {
-      if (settled) return
-      finish({
-        ok: false,
-        error: sawInit ? 'lark-mcp 提前退出' : 'lark-mcp 未能完成握手',
-        detail: `退出码 ${code}。${stderr ? `\n${redactDiagnostic(stderr, diagnosticSecrets).slice(-1200)}` : '无 stderr 输出。'}`,
-      })
-    })
-
-    sendRpc({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-      params: {
-        protocolVersion: '2024-11-05',
-        capabilities: {},
-        clientInfo: { name: 'dsh-feishu-mcp', version: '0.1.0' },
-      },
-    })
-  })
-}
-
+// ⛔ 2026-11-07 删除本段 lark-mcp 死代码（原 163-349 行）。
+//    删除内容：loadConfig / writeConfigFile / validateAppId / parseConfigText 的调用方 /
+//    runHandshake（手写 MCP 握手）。这些函数只服务于已移除的「凭据表单 + 测试握手」UI，
+//    config.set 与 handshake.test 两个 RPC 分支也已在 handleMethod 中删除。
+//    保留目标：feishu_cli 走 lark-cli，与此段无关。
+//    完整原实现见 index.js.bak-before-tools / index.js.bak-20261107-145442。
 // ---------------------------------------------------------------- lark-cli 桥
 
 /**
@@ -508,9 +312,45 @@ function flagValue(argv, flag) {
   return typeof value === 'string' && !value.startsWith('-') ? value : ''
 }
 
+/** 需要从命令回显与审计日志中隐藏值的参数。 */
+const SENSITIVE_FLAGS = new Set([
+  '--token', '--spreadsheet-token', '--access-token', '--app-secret', '--client-secret',
+  '--cookie', '--authorization', '--auth', '--password', '--secret', '--api-key',
+])
+
+/** 对命令参数做结构化脱敏，避免凭证进入模型上下文或 audit.jsonl。 */
+function redactCommandArgv(argv) {
+  const out = []
+  for (let index = 0; index < argv.length; index += 1) {
+    const item = String(argv[index])
+    const equals = item.indexOf('=')
+    const flag = equals > 0 ? item.slice(0, equals) : item
+    if (SENSITIVE_FLAGS.has(flag)) {
+      out.push(flag, '[REDACTED]')
+      if (equals < 0) index += 1
+      continue
+    }
+    if (item.startsWith('--header=')) {
+      const header = item.slice('--header='.length)
+      out.push(header.includes(':') && /^(authorization|cookie|x-api-key):/i.test(header)
+        ? `--header=${header.split(':', 1)[0]}: [REDACTED]`
+        : item)
+      continue
+    }
+    if (item === '--header' && typeof argv[index + 1] === 'string') {
+      const header = argv[index + 1]
+      out.push(item, /^(authorization|cookie|x-api-key):/i.test(header) ? `${header.split(':', 1)[0]}: [REDACTED]` : header)
+      index += 1
+      continue
+    }
+    out.push(item)
+  }
+  return out
+}
+
 /** 还原成可读命令行，带空格的参数加引号。 */
 function commandLine(argv) {
-  return argv.map((item) => (/\s/.test(item) ? JSON.stringify(item) : item)).join(' ')
+  return redactCommandArgv(argv).map((item) => (/\s/.test(item) ? JSON.stringify(item) : item)).join(' ')
 }
 
 /** 单个字符串字段的保留上限：`auth status` 的 scope 串有 4k+ 字符，没有阅读价值。 */
@@ -589,77 +429,23 @@ async function tryDryRun(ctx, argv, signal) {
   return result.json ?? null
 }
 
-/** 从 RPC payload 里解出一次调用要用的凭据，兼容「已存密钥、本次不重填」。 */
-function resolveCredentialInput(payload) {
-  const stored = loadConfig()
-  const incomingId = typeof payload?.appId === 'string' ? payload.appId.trim() : ''
-  const incomingSecret = typeof payload?.appSecret === 'string' ? payload.appSecret.trim() : ''
-  const keepSecret = payload?.keepAppSecret === true
-
-  return {
-    appId: incomingId.length > 0 ? incomingId : stored.appId,
-    appSecret: incomingSecret.length > 0 ? incomingSecret : keepSecret ? stored.appSecret : '',
-    domain: typeof payload?.domain === 'string' && payload.domain.trim().length > 0
-      ? payload.domain.trim() : stored.domain,
-    tools: Array.isArray(payload?.tools) && payload.tools.length > 0
-      ? payload.tools.filter((item) => typeof item === 'string') : stored.tools,
-    language: stored.language,
-    tokenMode: stored.tokenMode,
-    stored,
-  }
-}
+// ⛔ 2026-11-07 删除 resolveCredentialInput（原 411-429 行）。它只服务于已移除的
+//    config.set / handshake.test，且内部调用已删除的 loadConfig。原实现见 index.js.bak-20261107-145442。
 
 /** 处理一条 RPC 调用。所有分支都必须返回可 JSON 序列化的普通对象。 */
 async function handleMethod(method, payload, ctx) {
   switch (method) {
+    // ⛔ 2026-11-07 移除 config.set / handshake.test 分支，并把 config.get 缩为纯诊断信息。
+    //    原因：lark-mcp 链路已废弃（见 cordis.patch.yml 注释），凭据表单也已从 client.js 删除，
+    //    这三个分支不再有任何调用方，且会去读已被删除的 ~/.dsh/lark-mcp/lark-config.json。
+    //    完整原实现见 index.js.bak-20261107-*。
     case 'config.get': {
-      const config = loadConfig()
-      if (config.configError) return { ok: false, error: config.configError }
-      return {
-        appId: config.appId,
-        // 永不回显明文密钥，只告诉界面「有没有」。
-        hasAppSecret: config.appSecret.length > 0,
-        domain: config.domain,
-        tools: config.tools,
-        installed: existsSync(LARK_CLI),
-        configPath: LARK_CONFIG,
-      }
-    }
-
-    case 'config.set': {
-      const input = resolveCredentialInput(payload)
-       if (input.stored.configError) return { ok: false, error: input.stored.configError }
-      const appIdError = validateAppId(input.appId)
-      if (appIdError !== undefined) return { ok: false, error: appIdError }
-      if (input.appSecret.length === 0) return { ok: false, error: 'App Secret 不能为空' }
-
-      writeConfigFile({
-        appId: input.appId,
-        appSecret: input.appSecret,
-        tools: input.tools,
-        language: input.language,
-        domain: input.domain,
-        tokenMode: input.tokenMode,
-      })
-
       return {
         ok: true,
-        appId: input.appId,
-        hasAppSecret: true,
-        domain: input.domain,
-        tools: input.tools,
-        configPath: LARK_CONFIG,
+        // 凭据由 lark-cli 自行管理，DSH 侧不再持有 App Secret。
+        backend: 'lark-cli',
+        configPath: LARK_CLI_HOME,
       }
-    }
-
-    case 'handshake.test': {
-      const input = resolveCredentialInput(payload)
-       if (input.stored.configError) return { ok: false, error: input.stored.configError }
-      const appIdError = validateAppId(input.appId)
-      if (appIdError !== undefined) return { ok: false, error: appIdError }
-      if (input.appSecret.length === 0) return { ok: false, error: '请先填写 App Secret 再测试' }
-
-      return await runHandshake(input)
     }
 
     // ------------------------------------------------------------ 连接（阶段 3）
@@ -778,7 +564,7 @@ function registerEndpoint(ctx, connection) {
   })
 }
 
-export const __test = { parseConfigText, redactDiagnostic, shapeAuthStatus, handleMethod, AUTH_SCOPES }
+export const __test = { redactDiagnostic, redactCommandArgv, commandLine, shapeAuthStatus, handleMethod, AUTH_SCOPES }
 
 /**
  * 注册 agent 工具。
@@ -816,7 +602,6 @@ function registerTools(ctx) {
           userName: { type: 'string' },
           userOpenId: { type: 'string' },
           botStatus: { type: 'string' },
-          raw: { type: 'object', additionalProperties: true, description: 'CLI 原始返回' },
           error: { type: 'string' },
         },
         additionalProperties: true,
@@ -845,7 +630,6 @@ function registerTools(ctx) {
         userName: identities.user?.userName,
         userOpenId: identities.user?.openId,
         botStatus: identities.bot?.status,
-        raw: result.json,
       }
     },
   })
@@ -959,8 +743,15 @@ function registerTools(ctx) {
         { signal: exec.signal },
       )
       if (!result.ok) return { ok: false, error: describeCliFailure(result) }
-      // 登录成功后回读一次状态，把用户名带回给模型。
+      // 登录成功后回读一次状态，把用户名带回给模型；状态读取失败需要显式反馈。
       const status = await runLarkCli(ctx, ['auth', 'status', '--json'], { signal: exec.signal })
+      if (!status.ok || !status.json) {
+        return {
+          ok: false,
+          loginCompleted: true,
+          error: `授权已完成，但登录状态读取失败：${describeCliFailure(status)}`,
+        }
+      }
       return { ok: true, userName: status.json?.identities?.user?.userName }
     },
   })
@@ -1027,10 +818,10 @@ function registerTools(ctx) {
         ok: true,
         sheets: list.map((item) => ({
           sheetId: item.sheet_id ?? item.sheetId,
-          title: item.title ?? item.name,
-          rowCount: item.row_count ?? item.grid_properties?.row_count,
-          columnCount: item.column_count ?? item.grid_properties?.column_count,
-          hidden: Boolean(item.is_hidden ?? item.hidden),
+          title: item.title ?? item.name ?? item.sheet_name ?? item.sheetName ?? item.properties?.title,
+          rowCount: item.row_count ?? item.grid_properties?.row_count ?? item.gridProperties?.rowCount,
+          columnCount: item.column_count ?? item.grid_properties?.column_count ?? item.gridProperties?.columnCount,
+          hidden: Boolean(item.is_hidden ?? item.hidden ?? item.properties?.hidden),
         })),
       }
     },
@@ -1214,7 +1005,7 @@ function registerTools(ctx) {
           ok: { type: 'boolean' },
           blocked: { type: 'boolean', description: '是否被风险策略拦下' },
           dryRun: { type: 'boolean' },
-          risk: { type: 'string', description: 'read / write / destructive' },
+          risk: { type: 'string', description: 'read / write / destructive / unknown' },
           command: { type: 'string' },
           identity: { type: 'string' },
           revision: { type: 'integer', description: '写操作之后的文档版本号' },
@@ -1224,6 +1015,7 @@ function registerTools(ctx) {
           error: { type: 'string' },
           durationMs: { type: 'integer' },
           auditPath: { type: 'string' },
+          auditWritten: { type: 'boolean', description: '审计记录是否成功写入' },
         },
         additionalProperties: true,
       },
@@ -1268,7 +1060,7 @@ function registerTools(ctx) {
       if (needsConfirmation(classified.risk) && args?.confirm !== true) {
         const preview = await tryDryRun(ctx, finalArgs, exec.signal)
         // 被拦截的尝试也要留痕：反复试探越界本身就是值得追的信号。
-        appendAudit({
+        const auditWritten = appendAudit({
           risk: classified.risk,
           command,
           identity: as ?? 'auto',
@@ -1282,6 +1074,8 @@ function registerTools(ctx) {
           risk: classified.risk,
           command,
           preview,
+          auditWritten,
+          auditPath: auditPath(),
           error: `${describeRisk(classified.risk)}。确认无误后传 confirm:true 再执行。`,
         }
       }
@@ -1297,7 +1091,7 @@ function registerTools(ctx) {
       const result = await runLarkCli(ctx, finalArgs, { signal: exec.signal, timeoutMs: args?.timeoutMs })
       const revision = result.json?.data?.revision
 
-      appendAudit({
+      const auditWritten = appendAudit({
         risk: classified.risk,
         command,
         identity: as ?? 'auto',
@@ -1315,6 +1109,7 @@ function registerTools(ctx) {
           error: describeCliFailure(result),
           revision,
           auditPath: auditPath(),
+          auditWritten,
         }
       }
 
@@ -1339,6 +1134,7 @@ function registerTools(ctx) {
         before,
         durationMs: Date.now() - startedAt,
         auditPath: auditPath(),
+        auditWritten,
       }
     },
   })

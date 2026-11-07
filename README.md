@@ -15,6 +15,11 @@
 | MCP 服务（`@larksuiteoapi/lark-mcp`） | 应用机器人（`tenant_access_token`） | 调应用可见的开放接口 | 读不到你个人空间里的文档与表格；也没有读取单元格值的工具 |
 | CLI（`@larksuite/cli`） | 用户本人（OAuth 设备码） | 你本人能看到、能操作的都能做 | 需要一次浏览器授权 |
 
+> **本插件只用第二条路径。** 早先版本曾同时挂载 lark-mcp，但它的令牌依赖 `keytar`
+> 原生模块持久化；该模块缺失时令牌只存活于子进程内存，重启即失效并持续报
+> `user_access_token is invalid or expired`。两条链路能力又高度重叠，因此 lark-mcp
+> 已彻底移除，凭据表单与握手测试一并撤除。
+
 这个插件把第二条路径封装成 DSH 原生的三件东西：
 
 1. **一个「连接」面板** —— 点两下完成登录，不需要手填 App ID / App Secret；
@@ -71,7 +76,7 @@ node ~/.dsh/lark-cli/node_modules/@larksuite/cli/scripts/run.js \
 
 ### 4. 重启 DSH
 
-左侧导航会出现「飞书 MCP」，点进去 →「授权登录」→ 浏览器确认 →「我已完成授权」。
+左侧导航会出现「飞书」，点进去 →「授权登录」→ 浏览器确认 →「我已完成授权」。
 
 ---
 

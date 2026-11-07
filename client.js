@@ -130,19 +130,12 @@ window.__ModuleLoader__.load({
     const AUTH_TTL_MS = 60_000
 
     function FeishuPanel({ rpcCall }) {
-      const [form, setForm] = React.useState({ appId: '', appSecret: '', tools: 'preset.light' })
-      const [baseline, setBaseline] = React.useState(null)
-      const [customTools, setCustomTools] = React.useState(false)
-      const [meta, setMeta] = React.useState({ hasAppSecret: false, installed: false, configPath: '' })
+      // ⛔ 2026-11-07 凭据表单移除后，以下 state 只服务于已删除的 UI：
+      //    form / baseline / customTools / busy / gate / notice / actionError / result /
+      //    revision / testedRevision。全部删除。完整原代码见 client.js.bak-20261107-142846。
+      const [meta, setMeta] = React.useState({ configPath: '' })
       const [loading, setLoading] = React.useState(true)
       const [loadError, setLoadError] = React.useState('')
-      const [busy, setBusy] = React.useState('')
-      const gate = React.useRef(false)
-      const [notice, setNotice] = React.useState('')
-      const [actionError, setActionError] = React.useState('')
-      const [result, setResult] = React.useState(null)
-      const [revision, setRevision] = React.useState(0)
-      const [testedRevision, setTestedRevision] = React.useState(-1)
       // 连接（登录）状态：与凭据表单解耦，读不到也不该挡住应用配置。
       const [auth, setAuth] = React.useState(() => {
         const cached = authCache.value !== null && Date.now() - authCache.at < AUTH_TTL_MS
@@ -160,10 +153,10 @@ window.__ModuleLoader__.load({
           if (typeof rpcCall !== 'function') throw new Error('配置服务暂不可用')
           const value = await rpcCall('config.get', {})
           if (value?.ok === false) throw new Error(value.error || '读取失败')
-          if (!value || typeof value.appId !== 'string') throw new Error('配置响应无效')
+          if (!value || typeof value !== 'object') throw new Error('配置响应无效')
           if (!alive.current) return
-          const next = { appId: value.appId, appSecret: '', tools: Array.isArray(value.tools) ? value.tools.join(',') : 'preset.light' }
-          setForm(next); setBaseline(next); setMeta(value)
+          // 只保留诊断信息（配置路径）。凭据表单已删除，不再需要 form/baseline。
+          setMeta({ configPath: typeof value.configPath === 'string' ? value.configPath : '' })
         } catch { if (alive.current) setLoadError('未能读取配置。请重试；现有配置未被修改。') }
         finally { if (alive.current) setLoading(false) }
       }, [rpcCall])
@@ -231,41 +224,13 @@ window.__ModuleLoader__.load({
           if (alive.current) setAuthBusy('')
         }
       }
-      const dirty = baseline !== null && Object.keys(form).some(key => form[key] !== baseline[key])
-      const change = (key, value) => {
-        setForm(previous => ({ ...previous, [key]: value })); setRevision(n => n + 1)
-        setNotice(''); setActionError('')
-      }
-      const perform = async (kind) => {
-        if (gate.current || loading || loadError) return
-        const tools = form.tools.split(',').map(item => item.trim()).filter(Boolean)
-        if (!/^cli_[A-Za-z0-9]+$/.test(form.appId.trim())) { setActionError('请填写 cli_ 开头的有效 App ID。'); return }
-        if (!form.appSecret.trim() && !meta.hasAppSecret) { setActionError('请在本地表单填写 App Secret。'); return }
-        if (!tools.length) { setActionError('请至少选择一个工具集。'); return }
-        gate.current = true; setBusy(kind); setActionError(''); setNotice('')
-        if (kind === 'test') setResult(null)
-        try {
-          const value = await rpcCall(kind === 'save' ? 'config.set' : 'handshake.test', {
-            appId: form.appId.trim(), tools,
-            ...(form.appSecret.trim() ? { appSecret: form.appSecret.trim() } : { keepAppSecret: meta.hasAppSecret }),
-          })
-          if (!alive.current) return
-          if (kind === 'test') { setResult(value ?? { ok: false, error: '测试服务没有返回结果' }); setTestedRevision(revision) }
-          else {
-            if (value?.ok !== true) throw new Error(value?.error || '保存失败')
-            const next = { appId: value.appId, appSecret: '', tools: value.tools.join(',') }
-            setForm(next); setBaseline(next); setMeta(previous => ({ ...previous, ...value }))
-            setNotice('已保存。重启 DSH 后，新配置才会用于会话中的飞书工具。')
-          }
-        } catch { if (alive.current) setActionError(kind === 'save' ? '保存失败，请检查配置后重试。' : '测试请求失败，请重试。') }
-        finally { gate.current = false; if (alive.current) setBusy('') }
-      }
-      const stale = result && testedRevision !== revision
-      const disabled = loading || !!loadError || !!busy
-      const input = (key, extra = {}) => h('input', { id: `feishu-${key}`, 'aria-describedby': `feishu-${key}-hint`, style: styles.input, value: form[key], disabled, spellCheck: false, autoComplete: 'off', onChange: e => change(key, e.target.value), ...extra })
-      const status = loading ? '读取中' : loadError ? '配置读取失败' : dirty ? '有未保存更改' : meta.hasAppSecret && form.appId ? '配置已保存' : '待配置'
+      // ⛔ 2026-11-07 移除整段凭据表单的交互逻辑（dirty / change / perform / stale /
+      //    disabled / input）。凭据表单与 MCP 握手按钮已删，这些函数不再有任何渲染路径调用。
+      //    完整原代码见 client.js.bak-20261107-142846。
       const connected = auth.status?.userStatus === 'ready'
-      const authLabel = auth.loading ? '读取中' : auth.error ? '状态未知' : connected ? '已连接' : '未连接'
+      // 三分支必须保留 auth.error：授权状态读取失败时要显示「状态未知」，
+      // 不能退化成「未连接」，否则会误导用户以为需要重新授权。
+      const status = loading ? '读取中' : loadError ? '状态读取失败' : auth.error ? '状态未知' : connected ? '已连接' : '未连接'
       const authDetail = connected
         ? [
           auth.status?.userName ? `账号：${auth.status.userName}` : '',
@@ -335,61 +300,32 @@ window.__ModuleLoader__.load({
         h('header', { style: { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' } },
           h('div', null,
             h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
-              h('h1', { style: { fontSize: 20, margin: 0, fontWeight: 650, letterSpacing: '-.01em' } }, '飞书 MCP'),
+              h('h1', { style: { fontSize: 20, margin: 0, fontWeight: 650, letterSpacing: '-.01em' } }, '飞书'),
               h('span', { style: styles.badge }, status)),
-            h('p', { style: { ...styles.hint, marginTop: 6 } }, '连接飞书自建应用，让 DSH 使用你授权的飞书工具。'))),
+            h('p', { style: { ...styles.hint, marginTop: 6 } }, '用你的飞书账号授权 lark-cli；DSH 的飞书能力（读群、建表、读写单元格、查文档）全部由它提供。'))),
         authCard,
         loadError ? h('div', { style: styles.card }, h('p', { role: 'alert', style: styles.error }, loadError),
           h('div', null, h('button', { style: styles.button, onClick: () => void load() }, '重新读取'))) : null,
         loading ? h('p', { role: 'status', style: styles.hint }, '正在读取本地配置…') : null,
-        !loading && !loadError ? h('details', { style: { ...styles.card, padding: 0, gap: 0, overflow: 'hidden' } },
-          h('summary', { style: { ...styles.summary, padding: '15px 20px', fontWeight: 500 } }, '高级 · 使用自己的应用（默认无需填写）'),
-          h('div', { style: { padding: '0 20px 20px', display: 'flex', flexDirection: 'column', gap: 16, borderTop: border }, 'aria-label': '应用配置', 'aria-busy': !!busy },
-            h('h2', { style: { fontSize: 13, margin: '18px 0 0', color: mix(60), fontWeight: 600 } }, '应用凭据'),
-            h(Field, { id: 'feishu-appId', label: 'App ID', hint: '飞书开放平台 → 开发者后台 → 凭证与基础信息。' }, input('appId', { placeholder: 'cli_xxxxxxxxxxxx' })),
-            h(Field, { id: 'feishu-appSecret', label: 'App Secret', hint: meta.hasAppSecret ? '已保存密钥。留空保持原值，填写新值会替换原密钥。' : '密钥保存于本机配置文件中，读取时不回显。' }, input('appSecret', { type: 'password', placeholder: meta.hasAppSecret ? '已配置 · 留空保持' : '填写应用密钥' })),
-            h('details', null,
-              h('summary', { style: styles.summary }, '高级设置 · 工具集'),
-              h('div', { style: { marginTop: 12, display: 'flex', flexDirection: 'column', gap: 12 } },
-                h(Field, { id: 'feishu-preset', label: '选择预设' },
-                  h('select', { id: 'feishu-preset', style: styles.input, disabled, value: !customTools && form.tools === 'preset.light' ? 'preset.light' : 'custom', onChange: e => { setCustomTools(e.target.value === 'custom'); if (e.target.value !== 'custom') change('tools', e.target.value) } },
-                    h('option', { value: 'preset.light' }, '常用工具（推荐）'), h('option', { value: 'custom' }, '自定义工具集（在下方编辑）'))),
-                h(Field, { id: 'feishu-tools', label: '工具集标识', hint: '多个工具集用英文逗号分隔，例如 preset.light,preset.calendar.default。实际可用工具取决于安装版本。' }, input('tools')))),
-            !meta.installed ? h('p', { role: 'status', style: styles.error }, '未检测到 lark-mcp，请安装后再测试。') : null,
-            h('hr', { style: styles.divider }),
-            h('div', { style: styles.row },
-              h('button', { type: 'button', style: { ...styles.primary, opacity: disabled || !dirty ? .5 : 1 }, disabled: disabled || !dirty, onClick: () => void perform('save') }, busy === 'save' ? '保存中…' : '保存配置'),
-              h('button', { type: 'button', style: { ...styles.button, opacity: disabled || !meta.installed ? .5 : 1 }, disabled: disabled || !meta.installed, onClick: () => void perform('test') }, busy === 'test' ? '正在测试…' : '测试 MCP 握手')),
-            h('p', { style: styles.hint }, '测试使用当前填写内容，不会保存配置。保存后需重启 DSH 生效。'),
-            notice ? h('p', { role: 'status', style: { ...styles.hint, color: SUCCESS } }, notice) : null,
-            actionError ? h('p', { role: 'alert', style: styles.error }, actionError) : null)) : null,
-        h('section', { style: { ...styles.card, gap: 12 }, 'aria-label': '最近测试结果', 'aria-live': 'polite' },
-          h('div', { style: styles.between },
-            h('h2', { style: { fontSize: 13, margin: 0, color: mix(60), fontWeight: 600 } }, '最近测试'),
-            result && stale ? h('span', { style: styles.badge }, '配置已修改') : null),
-          busy === 'test' ? h('p', { style: styles.hint }, '正在启动服务并读取工具列表，最长约一分钟…') :
-            !result ? h('p', { style: styles.hint }, '尚未测试。握手用于检查 MCP 服务启动与工具发现，不代表飞书业务权限已验证。') :
-              h(React.Fragment, null,
-                h('strong', { style: { fontSize: 13.5, fontWeight: 600 } }, stale ? '结果已过期 · 配置已修改，请重新测试' : result.ok ? `握手成功 · 发现 ${result.toolCount} 个工具` : '握手失败'),
-                result.ok ? h('p', { style: styles.hint }, '服务可启动并返回工具列表。凭据和具体权限仍需通过实际飞书操作确认；这里不表示会话已连接。') :
-                  h('p', { style: styles.error }, result.error || '未知错误'),
-                result.serverInfo?.name ? h('p', { style: styles.hint }, `${result.serverInfo.name} ${result.serverInfo.version || ''}`) : null,
-                result.ok && Array.isArray(result.tools) ? h('details', null, h('summary', { style: styles.summary }, '查看工具列表'),
-                  h('ul', { style: { ...styles.mono, maxHeight: 240, overflowY: 'auto', paddingLeft: 20, margin: '8px 0 0' } }, result.tools.map((name, i) => h('li', { key: `${name}-${i}` }, name)))) : null,
-                result.detail ? h('details', null, h('summary', { style: styles.summary }, '错误详情'), h('pre', { style: styles.mono }, result.detail)) : null)),
+        // ⛔ 2026-11-07 移除「高级 · 使用自己的应用」凭据表单（App ID / App Secret / 工具集 /
+        //    保存配置 / 测试 MCP 握手）。原因：lark-mcp 连接行已停用（见
+        //    ~/.dsh/profiles/desktop/cordis.patch.yml），这块表单填了也不再有任何消费方，
+        //    留着只会误导人以为 mcp__feishu__* 还在。完整原代码见 client.js.bak-20261107-142846。
+        // ▶ 要恢复：从备份文件拷回本段即可。
+        // 「最近测试」卡片随握手按钮一并移除——没有测试入口，这张卡片只会在页面上留一句「尚未测试」。
         h('details', null, h('summary', { style: { ...styles.summary, padding: '4px 2px' } }, '诊断信息'),
           h('p', { style: { ...styles.mono, marginTop: 8 } }, meta.configPath || '配置路径未读取'),
-          h('p', { style: { ...styles.hint, marginTop: 6 } }, '测试流程：启动临时 MCP 进程，完成初始化，再读取工具列表。正式工具连接由 DSH 的 MCP 客户端管理。'))))
+          h('p', { style: { ...styles.hint, marginTop: 6 } }, '飞书能力当前由 lark-cli（feishu_cli 工具）提供，DSH 侧不再挂载 lark-mcp 的 MCP 连接。'))))
     }
     return {
       inject: ['slots', 'connection'],
       apply(ctx) {
         const rpcCall = (endpoint, payload, signal) => ctx.connection.rpc.call('/api', 'feishu-mcp', { method: endpoint, payload }, signal).then(result => {
           if (result?.ok === true) return result.value
-          if (result?.ok === false) throw new Error(result.error?.message || '飞书 MCP 请求失败')
+          if (result?.ok === false) throw new Error(result.error?.message || '飞书请求失败')
           return result
         })
-        ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'feishu-mcp', order: 62, label: () => '飞书 MCP' }, Icon))
+        ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'feishu-mcp', order: 62, label: () => '飞书' }, Icon))
         ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'feishu-mcp', inject: () => ({ rpcCall }) }, FeishuPanel))
       },
     }
