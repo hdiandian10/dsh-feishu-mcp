@@ -1,0 +1,5 @@
+# dsh-feishu-mcp 配置包补丁：在空配置根上追加插件行。
+# 行 id `feishu-mcp` 是本行的稳定锚点；`name` 必须与 package.json 的包名一致。
+- insert:
+    - id: feishu-mcp
+      name: 'dsh-feishu-mcp'
